@@ -1,0 +1,4 @@
+# PyCharm
+venv/
+.idea/
+*.csv
