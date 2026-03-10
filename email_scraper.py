@@ -2,8 +2,11 @@ from collections import deque
 import urllib.parse
 import re
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from bs4 import BeautifulSoup
 import requests
+from requests.adapters import HTTPAdapter
 import requests.exceptions as request_exception
 
 
@@ -20,6 +23,16 @@ def get_page_path(url: str) -> str:
 def extract_emails(text: str) -> set[str]:
     email_pattern = r'[a-z0-9\.\-+]+@[a-z0-9\.\-+]+\.[a-z]+'
     return set(re.findall(email_pattern, text, re.I))
+
+
+def extract_mailto_emails(soup) -> set[str]:
+    emails = set()
+    for anchor in soup.find_all("a", href=re.compile(r'^mailto:', re.I)):
+        href = anchor.get("href", "")
+        email = href.split("mailto:")[-1].split("?")[0].strip()
+        if email:
+            emails.add(email)
+    return emails
 
 
 def normalize_link(link: str, base_url: str, page_path: str):
@@ -46,14 +59,32 @@ def filter_relevant_emails(emails, website):
     return filtered
 
 
-def scrape_website(start_url: str, max_count: int = 20):
+def _create_session():
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    })
+    return session
 
-    urls_to_process = deque([start_url])
+
+def _fetch_url(session, url):
+    try:
+        response = session.get(url, timeout=5)
+        response.raise_for_status()
+        return url, response.text
+    except request_exception.RequestException:
+        return url, None
+
+
+def scrape_website(start_url: str, max_count: int = 20, workers: int = 5):
+
     queued_urls = {start_url}
     scraped_urls = set()
     collected_emails = set()
-
-    count = 0
+    lock = threading.Lock()
 
     base_domain = urlparse(start_url).netloc
     base_url = get_base_url(start_url)
@@ -68,65 +99,72 @@ def scrape_website(start_url: str, max_count: int = 20):
         "/impressum"
     ]
 
+    # Build initial URL list: start_url first, then priority pages
+    urls_to_process = deque([start_url])
     for path in priority_paths:
         priority_url = base_url + path
-        urls_to_process.append(priority_url)
-        queued_urls.add(priority_url)
+        if priority_url not in queued_urls:
+            urls_to_process.append(priority_url)
+            queued_urls.add(priority_url)
 
-    while urls_to_process:
+    session = _create_session()
 
-        url = urls_to_process.popleft()
+    count = 0
 
-        if url in scraped_urls:
-            continue
+    while urls_to_process and count < max_count:
 
-        scraped_urls.add(url)
+        # Grab a batch of URLs to fetch in parallel
+        batch = []
+        while urls_to_process and len(batch) < workers:
+            url = urls_to_process.popleft()
+            if url not in scraped_urls:
+                batch.append(url)
+                scraped_urls.add(url)
 
-        count += 1
-        if count > max_count:
+        if not batch:
             break
 
-        print(f"[{count}] Processing {url}")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_fetch_url, session, url): url for url in batch}
 
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
+            for future in as_completed(futures):
+                url, html = future.result()
+                count += 1
+                print(f"[{count}] Processing {url}")
 
-        except (
-            request_exception.RequestException,
-            request_exception.MissingSchema,
-            request_exception.ConnectionError
-        ):
-            print("Request error")
-            continue
+                if html is None:
+                    continue
 
-        collected_emails.update(extract_emails(response.text))
+                collected_emails.update(extract_emails(html))
 
-        # STOP EARLY IF EMAIL FOUND (huge speed gain)
+                soup = BeautifulSoup(html, "lxml")
+                collected_emails.update(extract_mailto_emails(soup))
+
+                # Stop early if emails found
+                if collected_emails:
+                    continue
+
+                for anchor in soup.find_all("a"):
+                    link = anchor.get("href", "")
+                    if link.startswith("mailto:"):
+                        continue
+                    normalized_link = normalize_link(
+                        link,
+                        get_base_url(url),
+                        get_page_path(url)
+                    )
+                    parsed = urlparse(normalized_link)
+                    if parsed.netloc != base_domain:
+                        continue
+                    if normalized_link not in queued_urls and normalized_link not in scraped_urls:
+                        urls_to_process.append(normalized_link)
+                        queued_urls.add(normalized_link)
+
+        # If we found emails after this batch, stop crawling more pages
         if collected_emails:
             break
 
-        soup = BeautifulSoup(response.text, "lxml")
-
-        for anchor in soup.find_all("a"):
-
-            link = anchor.get("href", "")
-            normalized_link = normalize_link(
-                link,
-                get_base_url(url),
-                get_page_path(url)
-            )
-
-            parsed = urlparse(normalized_link)
-
-            if parsed.netloc != base_domain:
-                continue
-
-            if normalized_link not in queued_urls and normalized_link not in scraped_urls:
-
-                urls_to_process.append(normalized_link)
-                queued_urls.add(normalized_link)
-
+    session.close()
     return filter_relevant_emails(collected_emails, start_url)
 
 
